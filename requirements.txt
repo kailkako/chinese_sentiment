@@ -1,0 +1,10 @@
+sys
+json
+jieba
+logging
+functools
+numpy
+pathlib
+argparse
+scikit-learn
+tensorflow==2.12.0
