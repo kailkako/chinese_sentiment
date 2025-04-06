@@ -1,9 +1,6 @@
-
 from pathlib import Path
 import json
-
 import tensorflow as tf
-
 from main import model_fn
 
 PARAMS = './results/params.json'

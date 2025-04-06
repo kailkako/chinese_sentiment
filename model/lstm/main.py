@@ -6,128 +6,163 @@ import numpy as np
 import tensorflow as tf
 from pathlib import Path
 
+# 配置日志
+Path('results').mkdir(exist_ok=True)
+tf.get_logger().setLevel(logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    handlers=[
+        logging.FileHandler('results/main.log'),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+
 DATA_DIR = '../../data/hotel_comment'
 
-# Logging
-Path('results').mkdir(exist_ok=True)
-tf.logging.set_verbosity(logging.INFO)
-handlers = [
-    logging.FileHandler('results/main.log'),
-    logging.StreamHandler(sys.stdout)
-]
-logging.getLogger('tensorflow').handlers = handlers
-
-
-# Input function
+# 输入函数
 def parse_fn(line_words, line_tag):
-    # Encode in Bytes for TF
     words = [w.encode() for w in line_words.strip().split()]
     tag = line_tag.strip().encode()
     return (words, len(words)), tag
 
-
-def generator_fn(words, tags):
-    with Path(words).open('r', encoding='utf-8') as f_words, Path(tags).open('r', encoding='utf-8') as f_tags:
+def generator_fn(words_path, tags_path):
+    with Path(words_path).open('r', encoding='utf-8') as f_words, Path(tags_path).open('r', encoding='utf-8') as f_tags:
         for line_words, line_tag in zip(f_words, f_tags):
             yield parse_fn(line_words, line_tag)
 
-
 def input_fn(words_path, tags_path, params=None, shuffle_and_repeat=False):
     params = params if params is not None else {}
-    shapes = (([None], ()), ())  # shape of every sample
-    types = ((tf.string, tf.int32), tf.string)
-    defaults = (('<pad>', 0), '')
+
+    # 定义输出签名
+    output_signature = (
+        (
+            tf.TensorSpec(shape=(None,), dtype=tf.string),
+            tf.TensorSpec(shape=(), dtype=tf.int32)
+        ),
+        tf.TensorSpec(shape=(), dtype=tf.string)
+    )
 
     dataset = tf.data.Dataset.from_generator(
         functools.partial(generator_fn, words_path, tags_path),
-        output_shapes=shapes, output_types=types)
+        output_signature=output_signature
+    )
 
     if shuffle_and_repeat:
         dataset = dataset.shuffle(params['buffer']).repeat(params['epochs'])
 
+    # 批量处理和填充
+    padded_shapes = (
+        (
+            tf.TensorShape([None]),
+            tf.TensorShape([])
+        ),
+        tf.TensorShape([])
+    )
+    padding_values = (
+        (
+            b'<pad>',
+            0
+        ),
+        b''
+    )
+
     dataset = (dataset
-               .padded_batch(params.get('batch_size', 20), shapes, defaults)
-               .prefetch(1))
+               .padded_batch(
+                   params.get('batch_size', 20),
+                   padded_shapes=padded_shapes,
+                   padding_values=padding_values
+               )
+               .prefetch(tf.data.AUTOTUNE))
     return dataset
 
+# 模型定义
+class LSTMClassifier(tf.keras.Model):
+    def __init__(self, params):
+        super(LSTMClassifier, self).__init__()
+        self.params = params
+        self.vocab_words = tf.lookup.StaticHashTable(
+            initializer=tf.lookup.TextFileInitializer(
+                params['words'],
+                key_dtype=tf.string,
+                key_index=tf.lookup.TextFileIndex.WHOLE_LINE,
+                value_dtype=tf.int64,
+                value_index=tf.lookup.TextFileIndex.LINE_NUMBER
+            ),
+            default_value=params['num_oov_buckets']
+        )
+        self.tags_table = tf.lookup.StaticHashTable(
+            initializer=tf.lookup.TextFileInitializer(
+                params['tags'],
+                key_dtype=tf.string,
+                key_index=tf.lookup.TextFileIndex.WHOLE_LINE,
+                value_dtype=tf.int64,
+                value_index=tf.lookup.TextFileIndex.LINE_NUMBER
+            ),
+            default_value=0
+        )
+        self.w2v = np.load(params['w2v'])['embeddings']
+        self.w2v_var = tf.Variable(np.vstack([self.w2v, [[0.] * params['dim']]]), dtype=tf.float32, trainable=False)
+        self.dropout_rate = params['dropout']
+        self.lstm_size = params['lstm_size']
+        self.num_tags = 0
 
-def model_fn(features, labels, mode, params):
-    if isinstance(features, dict):
-        features = features['words'], features['nwords']
+        # 读取标签
+        with Path(params['tags']).open('r', encoding='utf-8') as f:
+            self.num_tags = sum(1 for _ in f)
 
-    # Read vocabs and inputs
-    dropout = params['dropout']
-    words, nwords = features
-    training = (mode == tf.estimator.ModeKeys.TRAIN)
-    vocab_words = tf.contrib.lookup.index_table_from_file(
-        params['words'], num_oov_buckets=params['num_oov_buckets'])
-    with Path(params['tags']).open(encoding='utf-8') as f:
-        indices = [idx for idx, tag in enumerate(f)]
-        num_tags = len(indices)
+        # LSTM 层
+        self.lstm_fw = tf.keras.layers.LSTM(self.lstm_size, return_sequences=False)
+        self.lstm_bw = tf.keras.layers.LSTM(self.lstm_size, return_sequences=False, go_backwards=True)
+        self.bidirectional = tf.keras.layers.Bidirectional(self.lstm_fw, backward_layer=self.lstm_bw)
+        self.dropout = tf.keras.layers.Dropout(self.dropout_rate)
+        self.dense = tf.keras.layers.Dense(self.num_tags)
 
-    # Word Embeddings
-    word_ids = vocab_words.lookup(words)
-    w2v = np.load(params['w2v'])['embeddings']
-    w2v_var = np.vstack([w2v, [[0.] * params['dim']]])
-    w2v_var = tf.Variable(w2v_var, dtype=tf.float32, trainable=False)
-    embeddings = tf.nn.embedding_lookup(w2v_var, word_ids)
-    embeddings = tf.layers.dropout(embeddings, rate=dropout, training=training)
+    def call(self, inputs, training=False):
+        words, nwords = inputs
+        # 查找单词 ID
+        word_ids = self.vocab_words.lookup(words)
+        # 获取词向量
+        embeddings = tf.nn.embedding_lookup(self.w2v_var, word_ids)
+        embeddings = tf.keras.layers.Dropout(self.dropout_rate)(embeddings, training=training)
 
-    # LSTM
-    t = tf.transpose(embeddings, perm=[1, 0, 2])
-    lstm_cell_fw = tf.contrib.rnn.LSTMBlockFusedCell(params['lstm_size'])
-    lstm_cell_bw = tf.contrib.rnn.LSTMBlockFusedCell(params['lstm_size'])
-    lstm_cell_bw = tf.contrib.rnn.TimeReversedFusedRNN(lstm_cell_bw)
-    _, (cf, hf) = lstm_cell_fw(t, dtype=tf.float32, sequence_length=nwords)
-    _, (cb, hb) = lstm_cell_bw(t, dtype=tf.float32, sequence_length=nwords)
-    output = tf.concat([hf, hb], axis=-1)
-    output = tf.layers.dropout(output, rate=dropout, training=training)
+        # LSTM
+        mask = tf.sequence_mask(nwords, maxlen=tf.shape(words)[1])
+        lstm_output = self.bidirectional(embeddings, mask=mask)
+        lstm_output = self.dropout(lstm_output, training=training)
 
-    # FC
-    logits = tf.layers.dense(output, num_tags)
-    pred_ids = tf.argmax(input=logits, axis=1)
+        # 全连接层
+        logits = self.dense(lstm_output)
+        return logits
 
-    if mode == tf.estimator.ModeKeys.PREDICT:
-        reversed_tags = tf.contrib.lookup.index_to_string_table_from_file(params['tags'])
-        pred_labels = reversed_tags.lookup(tf.argmax(input=logits, axis=1))
-        predictions = {
-            'classes_id': pred_ids,
-            'labels': pred_labels
-        }
-        return tf.estimator.EstimatorSpec(mode, predictions=predictions)
+    def train_step(self, data):
+        inputs, labels = data
+        with tf.GradientTape() as tape:
+            logits = self(inputs, training=True)
+            # 将标签从字符串转换为整数
+            tags = self.tags_table.lookup(labels)
+            loss = self.compiled_loss(tags, logits, regularization_losses=self.losses)
+        gradients = tape.gradient(loss, self.trainable_variables)
+        self.optimizer.apply_gradients(zip(gradients, self.trainable_variables))
+        self.compiled_metrics.update_state(tags, logits)
+        return {m.name: m.result() for m in self.metrics}
 
-    else:
-        # LOSS
-        tags_table = tf.contrib.lookup.index_table_from_file(params['tags'])
-        tags = tags_table.lookup(labels)
-        loss = tf.losses.sparse_softmax_cross_entropy(labels=tags, logits=logits)
+    def test_step(self, data):
+        inputs, labels = data
+        logits = self(inputs, training=False)
+        # 将标签从字符串转换为整数
+        tags = self.tags_table.lookup(labels)
+        self.compiled_loss(tags, logits, regularization_losses=self.losses)
+        self.compiled_metrics.update_state(tags, logits)
+        return {m.name: m.result() for m in self.metrics}
 
-        # Metrics
-        metrics = {
-            'acc': tf.metrics.accuracy(tags, pred_ids),
-            'precision': tf.metrics.precision(tags, pred_ids),
-            'recall': tf.metrics.recall(tags, pred_ids)
-        }
-
-        for metric_name, op in metrics.items():
-            tf.summary.scalar(metric_name, op[1])
-
-        if mode == tf.estimator.ModeKeys.TRAIN:
-            train_op = tf.train.AdamOptimizer().minimize(
-                loss, global_step=tf.train.get_or_create_global_step())
-            return tf.estimator.EstimatorSpec(mode, loss=loss, train_op=train_op)
-        elif mode == tf.estimator.ModeKeys.EVAL:
-            return tf.estimator.EstimatorSpec(
-                mode, loss=loss, eval_metric_ops=metrics)
-
-
+# 模型训练和评估
 if __name__ == '__main__':
     params = {
         'dim': 300,
         'lstm_size': 32,
         'dropout': 0.5,
         'num_oov_buckets': 1,
-        'epochs': 25,
+        'epochs': 5,
         'batch_size': 20,
         'buffer': 3500,
         'words': str(Path(DATA_DIR, 'vocab.words.txt')),
@@ -135,40 +170,52 @@ if __name__ == '__main__':
         'w2v': str(Path(DATA_DIR, 'w2v.npz'))
     }
 
+    # 保存参数
     with Path('results/params.json').open('w', encoding='utf-8') as f:
         json.dump(params, f, indent=4, sort_keys=True)
 
-
     def fwords(name):
-        return str(Path(DATA_DIR, '{}.words.txt'.format(name)))
-
+        return str(Path(DATA_DIR, f'{name}.words.txt'))
 
     def ftags(name):
-        return str(Path(DATA_DIR, '{}.labels.txt'.format(name)))
+        return str(Path(DATA_DIR, f'{name}.labels.txt'))
 
+    # 创建模型
+    model = LSTMClassifier(params)
 
-    train_inpf = functools.partial(input_fn, fwords('train'), ftags('train'),
-                                   params, shuffle_and_repeat=True)
-    eval_inpf = functools.partial(input_fn, fwords('eval'), ftags('eval'))
-    cfg = tf.estimator.RunConfig(save_checkpoints_secs=60)
-    estimator = tf.estimator.Estimator(model_fn, 'results/model', cfg, params)
-    Path(estimator.eval_dir()).mkdir(parents=True, exist_ok=True)
-    train_spec = tf.estimator.TrainSpec(input_fn=train_inpf)
-    eval_spec = tf.estimator.EvalSpec(input_fn=eval_inpf, throttle_secs=60)
-    tf.estimator.train_and_evaluate(estimator, train_spec, eval_spec)
+    # 编译模型
+    model.compile(
+        optimizer=tf.keras.optimizers.Adam(),
+        loss=tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True),
+        metrics=['accuracy']
+    )
 
+    # 准备数据
+    train_dataset = input_fn(fwords('train'), ftags('train'), params, shuffle_and_repeat=True)
+    eval_dataset = input_fn(fwords('eval'), ftags('eval'), params)
 
-    # Write predictions to file
+    # 训练和评估
+    model.fit(
+        train_dataset,
+        epochs=params['epochs'],
+        validation_data=eval_dataset
+    )
+
+    # 保存模型
+    model.save('results/model')
+
+    # 预测
     def write_predictions(name):
         Path('results/score').mkdir(parents=True, exist_ok=True)
-        with Path('results/score/{}.preds.txt'.format(name)).open('wb', encoding='utf-8') as f:
-            test_inpf = functools.partial(input_fn, fwords(name), ftags(name))
-            golds_gen = generator_fn(fwords(name), ftags(name))
-            preds_gen = estimator.predict(test_inpf)
-            for golds, preds in zip(golds_gen, preds_gen):
-                ((words, _), tag) = golds
-                f.write(b' '.join([tag, preds['labels'], ''.join(words)]) + b'\n')
+        test_dataset = input_fn(fwords(name), ftags(name), params)
+        golds_gen = generator_fn(fwords(name), ftags(name))
+        predictions = model.predict(test_dataset)
 
+        with Path(f'results/score/{name}.preds.txt').open('wb') as f:
+            for golds, pred in zip(golds_gen, predictions):
+                ((words, _), tag) = golds
+                pred_label = params['tags'].splitlines()[np.argmax(pred)]
+                f.write(b' '.join([tag, pred_label.encode(), b''.join(words)]) + b'\n')
 
     for name in ['train', 'eval']:
         write_predictions(name)
